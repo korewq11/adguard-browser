@@ -213,6 +213,30 @@ class Session:
                 return True
         return False
 
+    async def accept_terms(self):
+        terms = self.page.locator('input#eulaConfirmed, input[name="eulaConfirmed"]')
+        try:
+            count = await terms.count()
+            if count == 0:
+                return True
+            if count == 1 and await terms.is_checked():
+                return True
+            if count == 1 and await terms.is_enabled():
+                # A styled checkbox can be hidden or outside the viewport.
+                # Click its actual label, allowing the page's React handler to run.
+                labels = self.page.locator('label[for="eulaConfirmed"], label:has(input#eulaConfirmed), label:has(input[name="eulaConfirmed"])')
+                if await labels.count() == 1 and await labels.is_visible():
+                    await labels.click(timeout=3000)
+                elif await terms.is_visible():
+                    await terms.check(timeout=3000)
+                if await terms.is_checked():
+                    return True
+        except Exception as exc:
+            logging.warning("Terms interaction needs human action: reason=%s", diagnostic_reason(exc))
+        self.phase = "manual"
+        self.message = "Поставь галочку согласия с условиями в изображении браузера, затем нажми «Продолжить» над ним."
+        return False
+
     async def drive(self):
         if self.phase in TERMINAL or self.phase == "manual":
             return
@@ -235,9 +259,8 @@ class Session:
             self.operation = "fill-password"
             await password_input.fill(self.password, timeout=3000)
         self.operation = "accept-terms"
-        terms = self.page.locator('input#eulaConfirmed, input[name="eulaConfirmed"]')
-        if await terms.count() and not await terms.is_checked():
-            await terms.check(force=True, timeout=3000)
+        if not await self.accept_terms():
+            return
         # Newsletter boxes are deliberately left unchecked.
         self.operation = "inspect-captcha"
         captcha = self.captcha_required or await self.captcha_visible()
