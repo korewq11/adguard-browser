@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import secrets
 import time
+import traceback
 from urllib.parse import parse_qs, urlsplit
 
 from aiohttp import web
@@ -20,6 +21,36 @@ ACCOUNT_HOSTS = {"adguardaccount.com", "account.adguardaccount.com", "account.ad
 WIDTH, HEIGHT = 960, 720
 TTL = 720
 TERMINAL = {"ready", "error", "expired", "stopped"}
+
+
+def diagnostic_reason(exc):
+    # Emit only known constant signatures, never Playwright call logs/form values.
+    text = str(exc)
+    network = re.search(r"net::ERR_[A-Z0-9_]+", text)
+    if network:
+        return network.group(0)
+    lowered = text.lower()
+    signatures = [
+        ("no usable sandbox", "NO_USABLE_SANDBOX"),
+        ("failed to move to new namespace", "NAMESPACE_DENIED"),
+        ("missing dependencies", "MISSING_LIBRARIES"),
+        ("error while loading shared libraries", "MISSING_LIBRARIES"),
+        ("page crashed", "PAGE_CRASHED"),
+        ("target page, context or browser has been closed", "TARGET_CLOSED"),
+        ("interrupted by another navigation", "NAVIGATION_INTERRUPTED"),
+        ("strict mode violation", "STRICT_LOCATOR"),
+        ("element is not editable", "ELEMENT_NOT_EDITABLE"),
+        ("execution context was destroyed", "CONTEXT_DESTROYED"),
+        ("frame was detached", "FRAME_DETACHED"),
+        ("timeout", "TIMEOUT"),
+    ]
+    return next((code for fragment, code in signatures if fragment in lowered), "UNCLASSIFIED")
+
+
+def diagnostic_location(exc):
+    frames = traceback.extract_tb(exc.__traceback__)
+    local = [f"{frame.name}:{frame.lineno}" for frame in frames if Path(frame.filename).name == "service.py"]
+    return ">".join(local[-3:]) or "unknown"
 
 
 def credential_digest(email, password):
@@ -54,6 +85,7 @@ class Session:
     phase: str = "opening"
     message: str = "Запускаю браузер…"
     stage: str = "register"
+    operation: str = "starting"
     verified: bool = False
     confirmed: bool = False
     password_accepted: bool = False
@@ -149,16 +181,19 @@ class Session:
             await route.continue_()
 
     async def new_page(self, stage):
+        self.operation = "new-context"
         if self.context is not None:
             await self.context.close()
         self.stage = stage
         self.context = await self.browser.new_context(viewport={"width": WIDTH, "height": HEIGHT})
+        self.operation = "new-page"
         self.page = await self.context.new_page()
         self.page.on("response", lambda response: self.response(response, stage))
         await self.context.route("**/*", self.route)
         self.submitted = ""
         self.captcha_ack = False
         self.captcha_required = False
+        self.operation = "open-login-form"
         await self.page.goto(AUTH + "/login.html", wait_until="domcontentloaded", timeout=45000)
 
     async def visible(self, selector):
@@ -190,20 +225,26 @@ class Session:
             self.verified = True
             self.phase, self.message = "ready", "Вход с паролем подтверждён."
             return
+        self.operation = "inspect-form"
         email_input = await self.visible('input[type="email"]')
         password_input = await self.visible('input[type="password"]')
         if email_input and await email_input.input_value() != self.email:
+            self.operation = "fill-email"
             await email_input.fill(self.email, timeout=3000)
         if password_input and await password_input.input_value() != self.password:
+            self.operation = "fill-password"
             await password_input.fill(self.password, timeout=3000)
+        self.operation = "accept-terms"
         terms = self.page.locator('input#eulaConfirmed, input[name="eulaConfirmed"]')
         if await terms.count() and not await terms.is_checked():
             await terms.check(force=True, timeout=3000)
         # Newsletter boxes are deliberately left unchecked.
+        self.operation = "inspect-captcha"
         captcha = self.captcha_required or await self.captcha_visible()
         if captcha and not self.captcha_ack:
             self.phase, self.message = "captcha", "Пройди CAPTCHA и нажми «Продолжить»."
             return
+        self.operation = "inspect-otp"
         code_input = await self.visible('input[autocomplete="one-time-code"], input[inputmode="numeric"], input[maxlength="6"], input[maxlength="1"]')
         if code_input:
             switch = self.page.get_by_role("button", name=re.compile(
@@ -244,6 +285,7 @@ class Session:
             self.submitted = signature
             self.captcha_ack = False
             self.captcha_required = False
+            self.operation = "submit-form"
             await button.click(timeout=3000)
             if self.phase not in {"captcha", "otp", "manual"}:
                 self.phase = "working" if self.stage == "register" else "verifying"
@@ -253,6 +295,7 @@ class Session:
         try:
             from playwright.async_api import async_playwright
             self.driver = await async_playwright().start()
+            self.operation = "launch-chromium"
             self.browser = await self.driver.chromium.launch(
                 headless=True, chromium_sandbox=os.environ.get("BROWSER_NO_SANDBOX") != "1",
                 args=["--disable-dev-shm-usage", "--renderer-process-limit=1", "--js-flags=--max-old-space-size=96"],
@@ -273,7 +316,10 @@ class Session:
             if self.browser is None:
                 logging.error("Chromium launch failure: %s", str(exc)[:1500])
             else:
-                logging.error("Browser operation failure: stage=%s type=%s", self.stage, type(exc).__name__)
+                reason = diagnostic_reason(exc)
+                self.message = f"Ошибка браузера: {self.operation}, {reason}. Подробности в Render Logs."
+                logging.error("Browser operation failure: stage=%s operation=%s type=%s reason=%s location=%s",
+                              self.stage, self.operation, type(exc).__name__, reason, diagnostic_location(exc))
         finally:
             await self.cleanup()
 
