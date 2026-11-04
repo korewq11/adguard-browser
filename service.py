@@ -61,7 +61,9 @@ def account_location(url):
     parsed = urlsplit(url)
     return (parsed.scheme == "https" and parsed.hostname in ACCOUNT_HOSTS
             and not parsed.username and not parsed.password
-            and (parsed.path == "/account" or parsed.path.startswith("/account/")))
+            and (parsed.path in {"/", "/account", "/activity", "/activity.html",
+                                 "/overview", "/overview.html", "/dashboard"}
+                 or parsed.path.startswith("/account/")))
 
 
 def login_accepted(data):
@@ -117,6 +119,10 @@ class Session:
                   "verified": self.verified, "stage": self.stage,
                   "started_at": self.started_at, "otp_since": self.otp_since,
                   "expires_in": max(0, int(TTL - (time.monotonic() - self.created)))}
+        result["build"] = "account-flow-3"
+        if self.phase not in TERMINAL:
+            result["message"] += (f" [account-flow-3; {self.stage}; "
+                                  f"password={int(self.password_accepted)}; email={int(self.confirmed)}]")
         if base:
             result["view_url"] = f"{base}/#session={self.ident}&token={self.view_token}"
         return result
