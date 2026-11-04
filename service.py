@@ -95,6 +95,7 @@ class Session:
     message: str = "Запускаю браузер…"
     stage: str = "register"
     operation: str = "starting"
+    loop_ticks: int = 0
     verified: bool = False
     confirmed: bool = False
     password_accepted: bool = False
@@ -119,10 +120,11 @@ class Session:
                   "verified": self.verified, "stage": self.stage,
                   "started_at": self.started_at, "otp_since": self.otp_since,
                   "expires_in": max(0, int(TTL - (time.monotonic() - self.created)))}
-        result["build"] = "account-flow-3"
+        result["build"] = "account-flow-4"
         if self.phase not in TERMINAL:
-            result["message"] += (f" [account-flow-3; {self.stage}; "
-                                  f"password={int(self.password_accepted)}; email={int(self.confirmed)}]")
+            result["message"] += (f" [account-flow-4; {self.stage}; "
+                                  f"password={int(self.password_accepted)}; email={int(self.confirmed)}; "
+                                  f"tick={self.loop_ticks}; op={self.operation}]")
         if base:
             result["view_url"] = f"{base}/#session={self.ident}&token={self.view_token}"
         return result
@@ -207,7 +209,7 @@ class Session:
         self.captcha_ack = False
         self.captcha_required = False
         self.operation = "open-login-form"
-        await self.page.goto(AUTH + "/login.html", wait_until="domcontentloaded", timeout=45000)
+        await self.page.goto(AUTH + "/login.html", wait_until="commit", timeout=45000)
 
     async def visible(self, selector):
         locator = self.page.locator(selector)
@@ -250,10 +252,29 @@ class Session:
         self.message = "Поставь галочку согласия с условиями в изображении браузера, затем нажми «Продолжить» над ним."
         return False
 
+    async def account_evidence(self):
+        if account_location(getattr(self.page, "url", "")):
+            return True
+        # Some auth flows keep an auth URL or render the account in an iframe.
+        # This evidence ONLY initiates fresh password verification, never 'ready'.
+        self.operation = "inspect-account"
+        expected = "you logged in to your adguard account as " + self.email.casefold()
+        for frame in list(getattr(self.page, "frames", []))[:12]:
+            if urlsplit(frame.url).hostname not in AUTH_HOSTS | ACCOUNT_HOSTS:
+                continue
+            try:
+                body = await frame.locator("body").inner_text(timeout=1200)
+            except Exception:
+                continue
+            normalized = " ".join(body.casefold().split())
+            if expected in normalized:
+                return True
+        return False
+
     async def drive(self):
         if self.phase in TERMINAL:
             return
-        if self.stage == "register" and account_location(getattr(self.page, "url", "")):
+        if self.stage == "register" and await self.account_evidence():
             # Reaching the account area is only a signal to VERIFY, never success.
             self.initial_authenticated = True
         if self.stage == "register" and self.initial_authenticated:
@@ -348,6 +369,7 @@ class Session:
                     self.phase, self.message = "expired", "Время сессии истекло; данные аккаунта остаются у бота."
                     break
                 async with self.lock:
+                    self.loop_ticks += 1
                     await self.drive()
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
