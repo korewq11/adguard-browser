@@ -57,6 +57,13 @@ def credential_digest(email, password):
     return hashlib.sha256((email + "\0" + password).encode()).hexdigest()
 
 
+def account_location(url):
+    parsed = urlsplit(url)
+    return (parsed.scheme == "https" and parsed.hostname in ACCOUNT_HOSTS
+            and not parsed.username and not parsed.password
+            and (parsed.path == "/account" or parsed.path.startswith("/account/")))
+
+
 def login_accepted(data):
     redirect = str(data.get("redirect_url") or "").lower()
     return (data.get("success") is True and not data.get("error_code")
@@ -128,7 +135,7 @@ class Session:
                 return
             path = parsed.path
             watched = {"/api/1.0/web/user_lookup", "/api/1.0/web/registration",
-                       "/login_api/1.0/login", "/login_api/1.0/authorized"}
+                       "/login_api/1.0/login", "/login_api/1.0/login_authorized", "/login_api/1.0/authorized"}
             if path not in watched:
                 return
             posted = decode_body(response.request)
@@ -160,7 +167,7 @@ class Session:
                         self.password_accepted = True
                     elif self.stage == "register":
                         self.initial_authenticated = True
-            if path.endswith("/authorized") and self.stage == "register" and login_accepted(data):
+            if path in {"/login_api/1.0/login_authorized", "/login_api/1.0/authorized"} and self.stage == "register" and login_accepted(data):
                 self.initial_authenticated = True
         except Exception:
             # No response bodies, form values or cookies in logs.
@@ -238,8 +245,11 @@ class Session:
         return False
 
     async def drive(self):
-        if self.phase in TERMINAL or self.phase == "manual":
+        if self.phase in TERMINAL:
             return
+        if self.stage == "register" and account_location(getattr(self.page, "url", "")):
+            # Reaching the account area is only a signal to VERIFY, never success.
+            self.initial_authenticated = True
         if self.stage == "register" and self.initial_authenticated:
             # Drop ALL cookies from OTP/registration before password verification.
             self.phase, self.message = "verifying", "Проверяю пароль в новой браузерной сессии…"
@@ -248,6 +258,8 @@ class Session:
         if self.stage == "verify" and self.confirmed and self.password_accepted:
             self.verified = True
             self.phase, self.message = "ready", "Вход с паролем подтверждён."
+            return
+        if self.phase == "manual":
             return
         self.operation = "inspect-form"
         email_input = await self.visible('input[type="email"]')
