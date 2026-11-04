@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: adguard-browser
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BROWSER_SERVICE_KEY
+        generateValue: true
